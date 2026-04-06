@@ -1,5 +1,5 @@
 {
-	"name": "@luna/template",
+	"name": "@seomin0610/luna-plugin",
 	"description": "Template repo for making your own luna plugins",
 	"type": "module",
 	"scripts": {
