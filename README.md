@@ -42,6 +42,11 @@ Useful endpoints:
 }
 ```
 
+#### Examples of use:
+
+[video
+](https://cloud.waterwave.space/sharevid/2026-04-11%2021-36-09.mp4)
+
 ### Hunminjeongeum
 Attempts to localize track titles to Korean when Korean metadata is available.
 
