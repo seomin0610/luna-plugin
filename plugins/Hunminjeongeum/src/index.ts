@@ -18,9 +18,15 @@ type SearchResultPayload = {
 	tracks: { items: Track[] };
 	topHits?: SearchTopHit;
 };
+const isSameItemId = (a: ItemId | null | undefined, b: ItemId | null | undefined) => {
+	if (a === undefined || a === null) return false;
+	if (b === undefined || b === null) return false;
+	return String(a) === String(b);
+};
 
 export type HunminjeongeumStorage = {
 	enabled: boolean;
+	testMode: boolean;
 	/**
 	 * Cached translations by ISRC (uppercased).
 	 */
@@ -39,6 +45,7 @@ export type HunminjeongeumStorage = {
 
 const defaultStorage: HunminjeongeumStorage = {
 	enabled: true,
+	testMode: false,
 	cache: {},
 	misses: {},
 	overrides: {
@@ -52,7 +59,14 @@ export let storage: HunminjeongeumStorage = { ...defaultStorage };
 
 const loadStorage = async () => {
 	try {
-		storage = await ReactiveStore.getPluginStorage<HunminjeongeumStorage>("Hunminjeongeum", defaultStorage);
+		const saved = await ReactiveStore.getPluginStorage<Partial<HunminjeongeumStorage>>("Hunminjeongeum", defaultStorage);
+		storage = {
+			...defaultStorage,
+			...saved,
+			cache: saved?.cache ?? {},
+			misses: saved?.misses ?? {},
+			overrides: saved?.overrides ?? {},
+		};
 	} catch (err) {
 		trace.err.withContext("getPluginStorage")(err);
 		storage = { ...defaultStorage };
@@ -63,6 +77,16 @@ await loadStorage();
 
 const HANGUL_RE = /[\uac00-\ud7a3]/;
 const hasHangul = (value?: string | null) => (value ? HANGUL_RE.test(value) : false);
+const normalizeIsrc = (value?: string | null) => (value ?? "").trim().toUpperCase();
+const trySetTrackTitle = (track: Track, title: string) => {
+	if (track.title === title) return true;
+	try {
+		track.title = title;
+		return track.title === title;
+	} catch {
+		return false;
+	}
+};
 
 const normalizeKey = (title: string, artist?: string | null) => {
 	const base = title.trim().toLowerCase();
@@ -83,12 +107,18 @@ const getOverrideTitle = (track: Track) => {
 };
 
 const getCachedTitle = (track: Track) => {
-	const isrc = (track.isrc ?? "").trim().toUpperCase();
+	const isrc = normalizeIsrc(track.isrc);
 	if (!isrc) return undefined;
 	return storage.cache[isrc];
 };
 
 const MISS_TTL_MS = 1000 * 60 * 60 * 24 * 7;
+const TRANSIENT_FAILURE_TTL_MS = 1000 * 60 * 10;
+const SERVICE_COOLDOWN_MS = 1000 * 60 * 2;
+const transientFailures = new Map<string, number>();
+let serviceCooldownUntil = 0;
+let lastServiceWarnAt = 0;
+
 const isFreshMiss = (isrc: string) => {
 	const lastMiss = storage.misses[isrc];
 	if (!lastMiss) return false;
@@ -97,38 +127,112 @@ const isFreshMiss = (isrc: string) => {
 	return false;
 };
 
+const isTransientFailureActive = (isrc: string) => {
+	const until = transientFailures.get(isrc);
+	if (!until) return false;
+	if (Date.now() < until) return true;
+	transientFailures.delete(isrc);
+	return false;
+};
+
 const shouldAttemptLookup = (track: Track) => {
 	if (!storage.enabled) return false;
 	if (!track?.title) return false;
 	if (hasHangul(track.title)) return false;
-	const isrc = (track.isrc ?? "").trim();
+	const isrc = normalizeIsrc(track.isrc);
 	if (!isrc) return false;
-	if (isFreshMiss(isrc.toUpperCase())) return false;
+	if (isFreshMiss(isrc)) return false;
+	if (isTransientFailureActive(isrc)) return false;
+	if (Date.now() < serviceCooldownUntil) return false;
 	if (hasHangul(getArtistName(track))) return true;
-	return isrc.toUpperCase().startsWith("KR");
+	return isrc.startsWith("KR");
 };
 
-const applyCachedTitle = (track: Track) => {
+const markTrackLocalized = (trackId: ItemId | null | undefined, isrc: string) => {
+	if (trackId !== undefined && trackId !== null) localizedTrackIds.add(trackId);
+	if (isrc) localizedTrackIsrcs.add(isrc);
+	const idMatched = isSameItemId(trackId, currentPlaybackTrackId);
+	const isrcMatched = !!isrc && isrc === currentPlaybackTrackIsrc;
+	if (idMatched || isrcMatched) {
+		setPlaybackDebugState({
+			isrc: currentPlaybackTrackIsrc,
+			localized: true,
+		});
+		scheduleLyricsBadgeRefresh();
+	}
+};
+
+const isTrackLocalized = (track?: Track | null) => {
+	if (!track) return false;
+	if (track.id !== undefined && track.id !== null && localizedTrackIds.has(track.id)) return true;
+	const isrc = normalizeIsrc(track.isrc);
+	if (isrc && localizedTrackIsrcs.has(isrc)) return true;
+	return !!getOverrideTitle(track) || !!getCachedTitle(track) || !!storage.overrides[`ISRC:${isrc}`];
+};
+
+type CacheApplyResult = {
+	status: "none" | "unchanged" | "updated";
+	title?: string;
+};
+const applyCachedTitle = (track: Track): CacheApplyResult => {
 	const override = getOverrideTitle(track);
 	if (override && override !== track.title) {
-		track.title = override;
-		return true;
+		markTrackLocalized(track.id, normalizeIsrc(track.isrc));
+		const updated = trySetTrackTitle(track, override);
+		return { status: updated ? "updated" : "unchanged", title: override };
+	}
+	if (override) {
+		markTrackLocalized(track.id, normalizeIsrc(track.isrc));
+		return { status: "unchanged", title: override };
 	}
 	const cached = getCachedTitle(track);
 	if (cached && cached !== track.title) {
-		track.title = cached;
-		return true;
+		markTrackLocalized(track.id, normalizeIsrc(track.isrc));
+		const updated = trySetTrackTitle(track, cached);
+		return { status: updated ? "updated" : "unchanged", title: cached };
 	}
-	return false;
+	if (cached) {
+		markTrackLocalized(track.id, normalizeIsrc(track.isrc));
+		return { status: "unchanged", title: cached };
+	}
+	return { status: "none" };
 };
 
 const observedTracksByIsrc = new Map<string, Set<Track>>();
 const observedTracksById = new Map<ItemId, Set<Track>>();
+const localizedTrackIds = new Set<ItemId>();
+const localizedTrackIsrcs = new Set<string>();
 const feedTrackIds = new Set<ItemId>();
 const feedIsrcs = new Set<string>();
 let lastFeedPayload: unknown | null = null;
 let feedRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let isReplayingFeed = false;
+let currentPlaybackTrackId: ItemId | null = null;
+let currentPlaybackTrackIsrc = "";
+
+export type HunminjeongeumPlaybackDebug = {
+	isrc: string;
+	localized: boolean;
+};
+
+let playbackDebugState: HunminjeongeumPlaybackDebug = {
+	isrc: "",
+	localized: false,
+};
+const playbackDebugSubscribers = new Set<() => void>();
+
+export const getPlaybackDebugState = () => playbackDebugState;
+
+export const subscribePlaybackDebugState = (listener: () => void) => {
+	playbackDebugSubscribers.add(listener);
+	return () => playbackDebugSubscribers.delete(listener);
+};
+
+const setPlaybackDebugState = (next: HunminjeongeumPlaybackDebug) => {
+	if (playbackDebugState.isrc === next.isrc && playbackDebugState.localized === next.localized) return;
+	playbackDebugState = next;
+	playbackDebugSubscribers.forEach((listener) => listener());
+};
 
 const registerTrackRef = (track: Track) => {
 	if (!track) return;
@@ -138,7 +242,7 @@ const registerTrackRef = (track: Track) => {
 		byId.add(track);
 		observedTracksById.set(id, byId);
 	}
-	const isrc = (track.isrc ?? "").trim().toUpperCase();
+	const isrc = normalizeIsrc(track.isrc);
 	if (!isrc) return;
 	const byIsrc = observedTracksByIsrc.get(isrc) ?? new Set<Track>();
 	byIsrc.add(track);
@@ -156,7 +260,7 @@ const broadcastTitleUpdate = (trackId: ItemId | undefined, isrc: string | undefi
 		if (byIsrc) for (const track of byIsrc) seen.add(track);
 	}
 	seen.forEach((track) => {
-		if (track.title !== title) track.title = title;
+		if (track.title !== title) trySetTrackTitle(track, title);
 	});
 	const inFeed = (trackId !== undefined && trackId !== null && feedTrackIds.has(trackId)) || (!!isrc && feedIsrcs.has(isrc));
 	if (inFeed) scheduleFeedRefresh();
@@ -293,12 +397,23 @@ const fetchTitleFromMusicBrainz = async (isrc: string): Promise<string | null> =
 	return null;
 };
 
-const isNotFoundError = (err: unknown) => err instanceof Error && err.message.startsWith("404");
+const getHttpStatus = (err: unknown) => {
+	if (!(err instanceof Error)) return null;
+	const match = err.message.match(/^(\d{3})\b/);
+	if (!match) return null;
+	const status = Number.parseInt(match[1], 10);
+	return Number.isNaN(status) ? null : status;
+};
+const isNotFoundError = (err: unknown) => getHttpStatus(err) === 404;
+const isTemporaryHttpError = (err: unknown) => {
+	const status = getHttpStatus(err);
+	return status === 429 || (status !== null && status >= 500);
+};
 
 const pendingLookups = new Map<string, Promise<string | null>>();
 const scheduleLookup = (track: Track) => {
 	if (!shouldAttemptLookup(track)) return;
-	const isrc = (track.isrc ?? "").trim().toUpperCase();
+	const isrc = normalizeIsrc(track.isrc);
 	if (!isrc) return;
 	if (pendingLookups.has(isrc)) return;
 	const task = (async () => {
@@ -306,6 +421,7 @@ const scheduleLookup = (track: Track) => {
 			const title = await fetchTitleFromMusicBrainz(isrc);
 			if (!title) return null;
 			if (!storage.cache[isrc]) storage.cache[isrc] = title;
+			markTrackLocalized(track.id, isrc);
 			broadcastTitleUpdate(track.id, isrc, title);
 			updateMediaItemTitleInStore(track.id, title);
 			updateSearchResultsTitle(track.id, title);
@@ -313,6 +429,16 @@ const scheduleLookup = (track: Track) => {
 		} catch (err) {
 			if (isNotFoundError(err)) {
 				storage.misses[isrc] = Date.now();
+				return null;
+			}
+			if (isTemporaryHttpError(err)) {
+				const now = Date.now();
+				transientFailures.set(isrc, now + TRANSIENT_FAILURE_TTL_MS);
+				serviceCooldownUntil = Math.max(serviceCooldownUntil, now + SERVICE_COOLDOWN_MS);
+				if (now - lastServiceWarnAt > 30_000) {
+					lastServiceWarnAt = now;
+					trace.warn.withContext("musicbrainz")("temporary unavailable; retry later");
+				}
 				return null;
 			}
 			trace.warn.withContext("musicbrainz")(err);
@@ -326,13 +452,28 @@ const scheduleLookup = (track: Track) => {
 const handleTrack = (track: Track) => {
 	if (!track || !storage.enabled) return;
 	registerTrackRef(track);
-	const changed = applyCachedTitle(track);
-	if (!changed) scheduleLookup(track);
+	const cacheResult = applyCachedTitle(track);
+	if (cacheResult.title) {
+		const isrc = normalizeIsrc(track.isrc);
+		broadcastTitleUpdate(track.id, isrc || undefined, cacheResult.title);
+		updateMediaItemTitleInStore(track.id, cacheResult.title);
+		updateSearchResultsTitle(track.id, cacheResult.title);
+	}
+	if (cacheResult.status === "none") scheduleLookup(track);
+};
+
+const getTrackFromStateById = (trackId: ItemId | null | undefined): Track | null => {
+	if (trackId === undefined || trackId === null) return null;
+	const mediaItem = redux.store.getState().content?.mediaItems?.[String(trackId)] as ReduxMediaItem | undefined;
+	if (!mediaItem || mediaItem.type !== "track") return null;
+	return mediaItem.item as Track;
 };
 
 const handleMediaItem = (mediaItem: ReduxMediaItem) => {
 	if (!mediaItem || mediaItem.type !== "track") return;
-	handleTrack(mediaItem.item as Track);
+	const track = mediaItem.item as Track;
+	handleTrack(track);
+	if (isSameItemId(track.id, currentPlaybackTrackId)) updateCurrentPlaybackTrack(track);
 };
 
 const handleFeedPayload = (payload: unknown, markAsFeed = false) => {
@@ -350,26 +491,180 @@ const handleFeedPayload = (payload: unknown, markAsFeed = false) => {
 		feedIsrcs.clear();
 		tracks.forEach((track) => {
 			feedTrackIds.add(track.id);
-			const isrc = (track.isrc ?? "").trim().toUpperCase();
+			const isrc = normalizeIsrc(track.isrc);
 			if (isrc) feedIsrcs.add(isrc);
 		});
 	}
 	tracks.forEach(handleTrack);
 };
 
+const HUNMIN_STYLE_ID = "hunminjeongeum-style";
+const HUNMIN_LYRICS_BADGE_ID = "hunminjeongeum-lyrics-badge";
+let lyricsBadgeQueued = false;
+
+const ensureHunminStyle = () => {
+	if (document.getElementById(HUNMIN_STYLE_ID)) return;
+	const style = document.createElement("style");
+	style.id = HUNMIN_STYLE_ID;
+	style.textContent = `
+		.hunminjeongeum-lyrics-badge-host {
+			display: flex;
+			justify-content: flex-end;
+			padding: 4px 0;
+		}
+		.hunminjeongeum-lyrics-badge {
+			display: inline-flex;
+			align-items: center;
+			padding: 2px 8px;
+			border-radius: 999px;
+			font-size: 11px;
+			font-weight: 600;
+			letter-spacing: 0.02em;
+			color: #063a0d;
+			background: rgba(101, 224, 128, 0.22);
+			border: 1px solid rgba(101, 224, 128, 0.52);
+		}
+	`;
+	document.head.appendChild(style);
+};
+
+const removeLyricsLocalizedBadge = () => {
+	const badge = document.getElementById(HUNMIN_LYRICS_BADGE_ID);
+	if (!badge) return;
+	const host = badge.parentElement;
+	badge.remove();
+	if (host && host.classList.contains("hunminjeongeum-lyrics-badge-host") && host.childElementCount === 0) host.remove();
+};
+
+const findLyricsBadgeHost = () => {
+	const line = document.querySelector<HTMLElement>("[data-test='lyrics-line']");
+	if (!line || !line.parentElement) return null;
+	const container = line.parentElement;
+	const existingHost = container.querySelector<HTMLElement>(".hunminjeongeum-lyrics-badge-host");
+	if (existingHost) return existingHost;
+	const host = document.createElement("div");
+	host.className = "hunminjeongeum-lyrics-badge-host";
+	container.prepend(host);
+	return host;
+};
+
+const renderLyricsLocalizedBadge = () => {
+	if (!document.body) return;
+	if (!storage.enabled || !playbackDebugState.localized) {
+		removeLyricsLocalizedBadge();
+		return;
+	}
+	const host = findLyricsBadgeHost();
+	if (!host) {
+		removeLyricsLocalizedBadge();
+		return;
+	}
+	ensureHunminStyle();
+	let badge = document.getElementById(HUNMIN_LYRICS_BADGE_ID) as HTMLSpanElement | null;
+	if (!badge) {
+		badge = document.createElement("span");
+		badge.id = HUNMIN_LYRICS_BADGE_ID;
+		badge.className = "hunminjeongeum-lyrics-badge";
+		badge.textContent = "한글화됨";
+	}
+	if (badge.parentElement !== host) host.appendChild(badge);
+};
+
+const scheduleLyricsBadgeRefresh = () => {
+	if (lyricsBadgeQueued) return;
+	lyricsBadgeQueued = true;
+	requestAnimationFrame(() => {
+		lyricsBadgeQueued = false;
+		renderLyricsLocalizedBadge();
+	});
+};
+
+export const refreshHunminUi = () => {
+	scheduleLyricsBadgeRefresh();
+};
+
+const updateCurrentPlaybackTrack = (track?: Track | null) => {
+	currentPlaybackTrackId = track?.id ?? null;
+	const trackInState = getTrackFromStateById(currentPlaybackTrackId);
+	currentPlaybackTrackIsrc = normalizeIsrc(track?.isrc) || normalizeIsrc(trackInState?.isrc);
+	const resolvedTrack = trackInState ?? track ?? null;
+	setPlaybackDebugState({
+		isrc: currentPlaybackTrackIsrc,
+		localized: isTrackLocalized(resolvedTrack),
+	});
+	scheduleLyricsBadgeRefresh();
+};
+
+const initializeCurrentPlaybackTrack = async () => {
+	try {
+		const item = await MediaItem.fromPlaybackContext();
+		updateCurrentPlaybackTrack((item?.tidalItem as Track | undefined) ?? null);
+	} catch (err) {
+		trace.warn.withContext("initPlaybackTrack")(err);
+		updateCurrentPlaybackTrack(null);
+	}
+};
+
+const initializeExistingTracks = () => {
+	const state = redux.store.getState();
+
+	// 1. content.mediaItems (앨범, 플레이리스트 등 이미 로드된 것들)
+	const mediaItems = state.content?.mediaItems ?? {};
+	Object.values(mediaItems).forEach((mediaItem) => {
+		handleMediaItem(mediaItem as ReduxMediaItem);
+	});
+
+	// 2. feed (홈 피드)
+	const feed = state.feed;
+	if (feed) handleFeedPayload(feed, true);
+
+	// 3. search 결과
+	const searchResults = state.search?.searchResults;
+	if (searchResults) {
+		lastSearchPayload = searchResults;
+		searchResults.tracks?.items?.forEach(handleTrack);
+		if (searchResults.topHits?.type === "TRACKS") {
+			handleTrack(searchResults.topHits.value);
+		}
+	}
+};
+
+initializeExistingTracks();
+await initializeCurrentPlaybackTrack();
+scheduleLyricsBadgeRefresh();
+
+const lyricsBadgeObserver = new MutationObserver(() => scheduleLyricsBadgeRefresh());
+const startLyricsBadgeObserver = () => {
+	if (!document.body) return;
+	lyricsBadgeObserver.observe(document.body, {
+		subtree: true,
+		childList: true,
+		attributes: false,
+	});
+};
+if (document.body) {
+	startLyricsBadgeObserver();
+} else {
+	const onReady = () => startLyricsBadgeObserver();
+	window.addEventListener("DOMContentLoaded", onReady, { once: true });
+	unloads.add(() => window.removeEventListener("DOMContentLoaded", onReady));
+}
+unloads.add(() => lyricsBadgeObserver.disconnect());
+unloads.add(() => removeLyricsLocalizedBadge());
+
 redux.intercept(
-		[
-			"content/LOAD_SINGLE_MEDIA_ITEM_SUCCESS",
-			"content/LOAD_ALL_ALBUM_MEDIA_ITEMS_SUCCESS",
-			"content/LOAD_ALL_ALBUM_MEDIA_ITEMS_WITH_CREDITS_SUCCESS",
-			"content/LOAD_PLAYLIST_SUGGESTED_MEDIA_ITEMS_SUCCESS",
-			"content/LOAD_PLAYLIST_SUCCESS",
-			"content/LOAD_LIST_ITEMS_PAGE_SUCCESS",
-			"content/LOAD_SUGGESTIONS_SUCCESS",
-			"content/RECEIVED_FULL_TRACK_LIST_MEDIA_ITEMS",
-			"content/LAZY_LOAD_MEDIA_ITEMS_SUCCESS",
-			"content/LOAD_RECENT_ACTIVITY_SUCCESS",
-			"content/LOAD_DYNAMIC_PAGE_SUCCESS",
+	[
+		"content/LOAD_SINGLE_MEDIA_ITEM_SUCCESS",
+		"content/LOAD_ALL_ALBUM_MEDIA_ITEMS_SUCCESS",
+		"content/LOAD_ALL_ALBUM_MEDIA_ITEMS_WITH_CREDITS_SUCCESS",
+		"content/LOAD_PLAYLIST_SUGGESTED_MEDIA_ITEMS_SUCCESS",
+		"content/LOAD_PLAYLIST_SUCCESS",
+		"content/LOAD_LIST_ITEMS_PAGE_SUCCESS",
+		"content/LOAD_SUGGESTIONS_SUCCESS",
+		"content/RECEIVED_FULL_TRACK_LIST_MEDIA_ITEMS",
+		"content/LAZY_LOAD_MEDIA_ITEMS_SUCCESS",
+		"content/LOAD_RECENT_ACTIVITY_SUCCESS",
+		"content/LOAD_DYNAMIC_PAGE_SUCCESS",
 		"route/LOADER_DATA__HOME--SUCCESS",
 		"feed/LOAD_FEED_SUCCESS",
 	],
@@ -419,13 +714,20 @@ redux.intercept("search/SEARCH_RESULT_SUCCESS", unloads, (payload) => {
 
 MediaItem.onMediaTransition(unloads, async (item) => {
 	const track = item?.tidalItem as Track | undefined;
+	updateCurrentPlaybackTrack(track);
 	if (!track) return;
-	const override = getOverrideTitle(track);
-	const cached = getCachedTitle(track);
-	const next = override ?? cached;
-	if (next && next !== track.title) {
-		updateMediaItemTitleInStore(track.id, next);
-	} else {
+	registerTrackRef(track);
+	const cacheResult = applyCachedTitle(track);
+	if (cacheResult.title) {
+		const isrc = normalizeIsrc(track.isrc);
+		broadcastTitleUpdate(track.id, isrc || undefined, cacheResult.title);
+		updateMediaItemTitleInStore(track.id, cacheResult.title);
+		updateSearchResultsTitle(track.id, cacheResult.title);
+	}
+	if (cacheResult.status === "none") {
 		scheduleLookup(track);
 	}
+	scheduleLyricsBadgeRefresh();
 });
+
+export { Settings } from "./Settings.tsx";

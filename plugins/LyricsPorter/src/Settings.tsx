@@ -3,13 +3,14 @@ import React from "react";
 import type { SelectChangeEvent } from "@mui/material/Select";
 import { LunaNumberSetting, LunaSelectItem, LunaSelectSetting, LunaSettings, LunaSwitchSetting, LunaTextSetting } from "@luna/ui";
 import type { OutputMode } from ".";
-import { startLyricsServer, stopLyricsServer, storage } from ".";
+import { startLyricsServer, startMetadataPorter, stopLyricsServer, stopMetadataPorter, storage } from ".";
 
 const clampPort = (value: number) => Math.min(65535, Math.max(1, value));
 
 export const Settings = () => {
 	const [enabled, setEnabled] = React.useState(storage.enabled);
 	const [port, setPort] = React.useState(storage.port);
+	const [metadataPort, setMetadataPort] = React.useState(storage.metadataPort);
 	const [outputMode, setOutputMode] = React.useState<OutputMode>(storage.outputMode);
 	const [udpHost, setUdpHost] = React.useState(storage.udpHost);
 
@@ -30,9 +31,29 @@ export const Settings = () => {
 		const next = checked ?? false;
 		setEnabled(next);
 		storage.enabled = next;
-		if (next) await startLyricsServer();
-		else await stopLyricsServer();
+		if (next) {
+			await startLyricsServer();
+			await startMetadataPorter();
+			setPort(storage.port);
+			setMetadataPort(storage.metadataPort);
+		} else {
+			await stopLyricsServer();
+			await stopMetadataPorter();
+		}
 	}, []);
+
+	const applyMetadataPort = React.useCallback(
+		async (value: number) => {
+			const next = clampPort(value);
+			setMetadataPort(next);
+			storage.metadataPort = next;
+			if (storage.enabled) {
+				await startMetadataPorter();
+				setMetadataPort(storage.metadataPort);
+			}
+		},
+		[setMetadataPort],
+	);
 
 	const onOutputModeChange = React.useCallback(
 		async (event: SelectChangeEvent<OutputMode>) => {
@@ -72,6 +93,15 @@ export const Settings = () => {
 					disabled={!enabled}
 					onNumber={applyPort}
 				/>
+				<LunaNumberSetting
+					title="Metadata Port"
+					desc="Separate HTTP port used for track metadata."
+					min={1}
+					max={65535}
+					value={metadataPort}
+					disabled={!enabled}
+					onNumber={applyMetadataPort}
+				/>
 				<LunaSelectSetting
 					title="Output"
 					desc="Choose how the current lyric line is exported."
@@ -106,6 +136,12 @@ export const Settings = () => {
 								? `tcp://127.0.0.1:${port}`
 								: `http://127.0.0.1:${port}`
 					}
+					InputProps={{ readOnly: true }}
+				/>
+				<LunaTextSetting
+					title="Metadata URL"
+					desc="JSON metadata (title, artist, max lyric length, next lyric length)."
+					value={`http://127.0.0.1:${metadataPort}/metadata.json`}
 					InputProps={{ readOnly: true }}
 				/>
 			</LunaSettings>

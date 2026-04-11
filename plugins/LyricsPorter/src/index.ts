@@ -1,7 +1,15 @@
 import { ReactiveStore, type LunaUnload, Tracer } from "@luna/core";
 import { MediaItem, PlayState } from "@luna/lib";
 
-import { setLyrics, startServer, stopServer } from "./lyricsServer.native";
+import {
+	setLyrics,
+	setMetadata,
+	startMetadataServer,
+	startServer,
+	stopMetadataServer,
+	stopServer,
+	type LyricsMetadata,
+} from "./lyricsServer.native";
 
 export const { trace } = Tracer("[LyricsPorter]");
 
@@ -12,6 +20,7 @@ export type OutputMode = "http" | "tcp" | "udp";
 export type LyricsPorterStorage = {
 	enabled: boolean;
 	port: number;
+	metadataPort: number;
 	outputMode: OutputMode;
 	udpHost: string;
 };
@@ -19,6 +28,7 @@ export type LyricsPorterStorage = {
 const defaultStorage: LyricsPorterStorage = {
 	enabled: true,
 	port: 1608,
+	metadataPort: 1609,
 	outputMode: "http",
 	udpHost: "127.0.0.1",
 };
@@ -27,7 +37,11 @@ export let storage: LyricsPorterStorage = { ...defaultStorage };
 
 const loadStorage = async () => {
 	try {
-		storage = await ReactiveStore.getPluginStorage<LyricsPorterStorage>("LyricsPorter", defaultStorage);
+		const saved = await ReactiveStore.getPluginStorage<Partial<LyricsPorterStorage>>("LyricsPorter", defaultStorage);
+		storage = {
+			...defaultStorage,
+			...saved,
+		};
 	} catch (err) {
 		trace.err.withContext("getPluginStorage")(err);
 		storage = { ...defaultStorage };
@@ -37,11 +51,86 @@ const loadStorage = async () => {
 await loadStorage();
 
 let lastLyric = "";
+let lastMetadata: LyricsMetadata = {
+	title: "",
+	artist: "",
+	maxLyricLength: 0,
+	nextLyricLength: 0,
+};
 let updateQueued = false;
 let timedLines: { time: number; text: string }[] = [];
 let lastTimedIndex = -1;
 
 const normalizeLyric = (value?: string | null) => (value ?? "").replace(/\u00a0/g, " ").trim();
+
+type TrackArtist = { name?: string | null };
+type TrackLike = {
+	title?: string | null;
+	artist?: TrackArtist | null;
+	artists?: TrackArtist[] | null;
+};
+
+const normalizePlainLines = (raw: string) =>
+	raw
+		.replace(/<br\s*\/?>/gi, "\n")
+		.replace(/<\/p>/gi, "\n")
+		.replace(/<[^>]+>/g, "")
+		.split(/\r?\n/)
+		.map((line) => normalizeLyric(line))
+		.filter((line) => line.length > 0);
+
+const extractLyricLines = (raw?: string | null) => {
+	if (!raw) return [];
+	const trimmed = raw.trim();
+	if (!trimmed) return [];
+	const timed = normalizeTimedLines(parseTimedLyrics(trimmed))
+		.map((line) => line.text)
+		.filter((line) => line.length > 0);
+	if (timed.length > 0) return timed;
+	return normalizePlainLines(trimmed);
+};
+
+const getMaxLyricLength = (...rawValues: Array<string | null | undefined>) => {
+	let maxLength = 0;
+	for (const raw of rawValues) {
+		const lines = extractLyricLines(raw);
+		for (const line of lines) {
+			if (line.length > maxLength) maxLength = line.length;
+		}
+	}
+	return maxLength;
+};
+
+const getTrackArtistName = (track?: TrackLike) => {
+	const list = (track?.artists ?? [])
+		.map((artist) => normalizeLyric(artist?.name))
+		.filter((name) => name.length > 0);
+	if (list.length > 0) return list.join(", ");
+	return normalizeLyric(track?.artist?.name);
+};
+
+const pushMetadata = (value: LyricsMetadata) => {
+	const next: LyricsMetadata = {
+		title: normalizeLyric(value?.title),
+		artist: normalizeLyric(value?.artist),
+		maxLyricLength: Math.max(0, Math.trunc(value?.maxLyricLength ?? 0)),
+		nextLyricLength: Math.max(0, Math.trunc(value?.nextLyricLength ?? 0)),
+	};
+	if (
+		next.title === lastMetadata.title &&
+		next.artist === lastMetadata.artist &&
+		next.maxLyricLength === lastMetadata.maxLyricLength &&
+		next.nextLyricLength === lastMetadata.nextLyricLength
+	)
+		return;
+	lastMetadata = next;
+	if (!storage.enabled) return;
+	try {
+		setMetadata(next);
+	} catch (err) {
+		trace.err.withContext("setMetadata")(err);
+	}
+};
 
 const parseTimeToSeconds = (value: string) => {
 	const trimmed = value.trim().replace(",", ".");
@@ -206,19 +295,51 @@ const getTimedLyric = () => {
 	return current.text;
 };
 
+const getNextLyricLength = () => {
+	if (timedLines.length === 0) return 0;
+	const currentTime = PlayState.currentTime ?? 0;
+	for (const line of timedLines) {
+		if (line.time <= currentTime) continue;
+		if (!line.text) continue;
+		return line.text.length;
+	}
+	return 0;
+};
+
 const loadTimedLyrics = async (mediaItem?: MediaItem) => {
 	try {
 		const item = mediaItem ?? (await MediaItem.fromPlaybackContext());
-		const lyricData = await item?.lyrics();
-		const timedRaw = lyricData?.subtitles ?? lyricData?.lyrics ?? "";
+		const track = item?.tidalItem as TrackLike | undefined;
+		let subtitleRaw = "";
+		let lyricRaw = "";
+		try {
+			const lyricData = await item?.lyrics();
+			subtitleRaw = lyricData?.subtitles ?? "";
+			lyricRaw = lyricData?.lyrics ?? "";
+		} catch (err) {
+			trace.warn.withContext("loadTimedLyrics.lyrics")(err);
+		}
+		const timedRaw = subtitleRaw || lyricRaw;
 		const parsed = normalizeTimedLines(parseTimedLyrics(timedRaw));
 		timedLines = parsed;
 		lastTimedIndex = -1;
+		pushMetadata({
+			title: normalizeLyric(track?.title),
+			artist: getTrackArtistName(track),
+			maxLyricLength: getMaxLyricLength(subtitleRaw, lyricRaw),
+			nextLyricLength: getNextLyricLength(),
+		});
 		// No timed lyrics? We'll just emit blanks unless DOM lyrics are visible.
 	} catch (err) {
 		trace.err.withContext("loadTimedLyrics")(err);
 		timedLines = [];
 		lastTimedIndex = -1;
+		pushMetadata({
+			title: "",
+			artist: "",
+			maxLyricLength: 0,
+			nextLyricLength: 0,
+		});
 	}
 };
 
@@ -365,6 +486,10 @@ const pushLyric = async (value?: string | null) => {
 };
 
 const readCurrentLine = () => {
+	pushMetadata({
+		...lastMetadata,
+		nextLyricLength: getNextLyricLength(),
+	});
 	if (!PlayState.playing) return pushLyric("");
 	if (timedLines.length > 0) return pushLyric(getTimedLyric());
 	const currentLine = findCurrentLine();
@@ -427,9 +552,31 @@ export const stopLyricsServer = async () => {
 		trace.err.withContext("stopLyricsServer")(err);
 	}
 };
+
+export const startMetadataPorter = async () => {
+	if (!storage.enabled) return;
+	try {
+		const actualPort = await startMetadataServer(storage.metadataPort);
+		if (storage.metadataPort !== actualPort) storage.metadataPort = actualPort;
+		trace.msg.log(`LyricsPorter metadata ready: http://127.0.0.1:${actualPort}`);
+		setMetadata(lastMetadata);
+	} catch (err) {
+		trace.err.withContext("startMetadataPorter")(err);
+	}
+};
+
+export const stopMetadataPorter = async () => {
+	try {
+		await stopMetadataServer();
+	} catch (err) {
+		trace.err.withContext("stopMetadataPorter")(err);
+	}
+};
 unloads.add(stopLyricsServer);
+unloads.add(stopMetadataPorter);
 
 await startLyricsServer();
+await startMetadataPorter();
 await loadTimedLyrics();
 readCurrentLine();
 
