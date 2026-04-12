@@ -44,6 +44,7 @@ Useful endpoints:
 
 #### Examples of use:
 
+end4(quickshell) + LyricsPorter
 [video
 ](https://cloud.waterwave.space/sharevid/2026-04-11%2021-36-09.mp4)
 
